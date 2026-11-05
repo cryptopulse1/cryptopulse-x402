@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cryptopulse": {
+      "url": "https://cryptopulse.saascloud.ai/mcp",
+      "description": "Pay-per-call crypto, halal/prayer and FX data (x402, USDC on Base/Solana). tools/list is free."
+    }
+  }
+}
