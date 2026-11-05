@@ -1455,7 +1455,7 @@ const EXT2_ROUTES = {
 };
 Object.assign(ROUTES, EXT2_ROUTES);
 function routeCategory(path) {
-  if (/^\/api\/(halal|mosques|prayer-times|qibla|trip)/.test(path)) return "halal";
+  if (/^\/api\/(halal|mosques|prayer-times|qibla|trip|zakat|islamic-calendar)/.test(path)) return "halal";
   if (path === "/api/fx") return "fx";
   return "crypto";
 }
@@ -1520,6 +1520,211 @@ ${body}
 <h2>Data sources</h2><p class="lead">Crypto: CoinGecko, DexScreener, GoPlus, DefiLlama, Hyperliquid, Blockscout, alternative.me. Halal places and mosques: © OpenStreetMap contributors (ODbL). FX: European Central Bank reference rates. Prayer times: astronomical computation. Facilitator: PayAI.</p>
 </main></body></html>`;
 }
+
+
+// ===== CryptoPulse extension 3: bridge/swap quotes (LI.FI), ENS, Zakat, Islamic calendar =====
+// Appended after ext2 (uses bazaarExt, ROUTES, halalSafe, hijriFromJD, julianDay, fetchFx helpers).
+
+// ---------- Bridge / swap quotes: Relay (primary, keyless) with LI.FI fallback ----------
+const LIFI = "https://li.quest/v1";
+const RELAY = "https://api.relay.link";
+const CHAIN_IDS = { ethereum: 1, eth: 1, mainnet: 1, base: 8453, arbitrum: 42161, arb: 42161, optimism: 10, op: 10, polygon: 137, matic: 137, bsc: 56, bnb: 56, avalanche: 43114, avax: 43114, gnosis: 100, linea: 59144, scroll: 534352, zksync: 324, blast: 81457, mantle: 5000, mode: 34443, celo: 42220, unichain: 130, berachain: 80094, sonic: 146, solana: "solana", sol: "solana" };
+const SOLANA_IDS = { relay: 792703809, lifi: 1151111081099710 };
+function chainId(x, provider) { if (!x) return null; const s = String(x).trim().toLowerCase(); if (/^\d+$/.test(s)) return +s; const v = CHAIN_IDS[s]; if (v === "solana") return SOLANA_IDS[provider]; return v || null; }
+function toUnits(amount, decimals) {
+  const [i, f = ""] = String(amount).split(".");
+  const frac = (f + "0".repeat(decimals)).slice(0, decimals);
+  return (BigInt(i || "0") * (10n ** BigInt(decimals)) + BigInt(frac || "0")).toString();
+}
+function fromUnits(units, decimals) { const s = BigInt(units || "0").toString().padStart(decimals + 1, "0"); const i = s.slice(0, s.length - decimals), f = s.slice(s.length - decimals).replace(/0+$/, ""); return +(i + (f ? "." + f : "")); }
+async function relayCurrency(chain, token) {
+  const isAddr = /^0x[0-9a-fA-F]{40}$/.test(token) || /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(token);
+  const body = isAddr ? { chainIds: [chain], address: token, limit: 5 } : { chainIds: [chain], term: token, limit: 8, verified: true };
+  const r = await fetch(`${RELAY}/currencies/v1`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error("token lookup failed");
+  const list = (await r.json()).flat().filter(Boolean);
+  const want = token.toLowerCase();
+  const hit = list.find((c) => (c.address || "").toLowerCase() === want) || list.find((c) => (c.symbol || "").toLowerCase() === want && c.metadata?.verified) || list.find((c) => (c.symbol || "").toLowerCase() === want) || (isAddr ? list[0] : null);
+  if (!hit) throw new Error(`unknown token ${token} on chain ${chain}`);
+  return { address: hit.address, decimals: hit.decimals, symbol: hit.symbol, name: hit.name };
+}
+async function relayQuote(fromChain, toChain, fromTok, toTok, amount, fromAddress, slippage, toAddress) {
+  const body = { user: fromAddress, originChainId: fromChain, destinationChainId: toChain, originCurrency: fromTok.address, destinationCurrency: toTok.address, amount: toUnits(amount, fromTok.decimals), tradeType: "EXACT_INPUT", slippageTolerance: String(Math.round(slippage * 10000)) };
+  if (toAddress) body.recipient = toAddress;
+  let j = null, lastMsg = "no route";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await fetch(`${RELAY}/quote`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json", "user-agent": "Mozilla/5.0 (compatible; CryptoPulse/1.0; +https://cryptopulse.saascloud.ai)" }, body: JSON.stringify(body), signal: AbortSignal.timeout(20000) });
+    if (r.ok) { j = await r.json(); break; }
+    try { lastMsg = (await r.json()).message || lastMsg; } catch {}
+    if (!/could not process|try again/i.test(lastMsg)) break;
+    await new Promise((res) => setTimeout(res, 700 * (attempt + 1)));
+  }
+  if (!j) throw new Error(String(lastMsg).slice(0, 160));
+  const d = j.details || {}, f = j.fees || {};
+  const usd = (x) => +(+(x?.amountUsd ?? x ?? 0)).toFixed(4);
+  const feeUsd = usd(f.relayerService) + usd(f.app), gasUsd = usd(f.gas) + usd(f.relayerGas);
+  return {
+    provider: "Relay", route: { tool: "relay", tool_name: "Relay", steps: (j.steps || []).map((s) => ({ id: s.id, action: s.action, kind: s.kind })) },
+    to_amount: +(d.currencyOut?.amountFormatted ?? fromUnits(d.currencyOut?.amount, toTok.decimals)), to_amount_min: d.currencyOut?.minimumAmount ? fromUnits(d.currencyOut.minimumAmount, toTok.decimals) : null, to_amount_usd: +(+(d.currencyOut?.amountUsd || 0)).toFixed(2), from_amount_usd: +(+(d.currencyIn?.amountUsd || 0)).toFixed(2),
+    gas_usd: +gasUsd.toFixed(4), fees_usd: +feeUsd.toFixed(4), fee_breakdown: Object.entries(f).map(([k, v]) => ({ name: k, usd: usd(v) })).filter((x) => x.usd), price_impact_pct: d.totalImpact?.percent != null ? +d.totalImpact.percent : null,
+    duration_seconds: d.timeEstimate ?? null, request_id: j.requestId || null,
+  };
+}
+async function lifiQuote(fromChainL, toChainL, fromTokenSym, toTokenSym, amount, fromAddress, slippage) {
+  const tr = await fetch(`${LIFI}/token?chain=${fromChainL}&token=${encodeURIComponent(fromTokenSym)}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+  if (!tr.ok) throw new Error(`unknown token ${fromTokenSym}`);
+  const fromToken = await tr.json();
+  const r = await fetch(`${LIFI}/quote?fromChain=${fromChainL}&toChain=${toChainL}&fromToken=${encodeURIComponent(fromToken.address)}&toToken=${encodeURIComponent(toTokenSym)}&fromAmount=${toUnits(amount, fromToken.decimals)}&fromAddress=${encodeURIComponent(fromAddress)}&slippage=${slippage}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(20000) });
+  if (!r.ok) { let msg = "no route"; try { msg = (await r.json()).message || msg; } catch {} throw new Error(String(msg).slice(0, 160)); }
+  const j = await r.json(); const est = j.estimate || {}, act = j.action || {}; const toDec = act.toToken?.decimals ?? 18;
+  const gasUsd = (est.gasCosts || []).reduce((s, g) => s + (+g.amountUSD || 0), 0), feeUsd = (est.feeCosts || []).reduce((s, f) => s + (+f.amountUSD || 0), 0);
+  return { provider: "LI.FI", route: { tool: j.tool, tool_name: j.toolDetails?.name || j.tool, steps: (j.includedSteps || []).map((s) => ({ type: s.type, tool: s.tool })) }, to_amount: fromUnits(est.toAmount, toDec), to_amount_min: fromUnits(est.toAmountMin, toDec), to_amount_usd: +(+est.toAmountUSD || 0).toFixed(2), from_amount_usd: +(+est.fromAmountUSD || 0).toFixed(2), gas_usd: +gasUsd.toFixed(4), fees_usd: +feeUsd.toFixed(4), fee_breakdown: (est.feeCosts || []).map((f) => ({ name: f.name, usd: +(+f.amountUSD || 0).toFixed(4) })), price_impact_pct: null, duration_seconds: est.executionDuration ?? null, to_symbol: act.toToken?.symbol, from_symbol: act.fromToken?.symbol };
+}
+async function fetchBridgeQuote(q, mode) {
+  const fromName = q.get("from_chain") || "base", toName = q.get("to_chain") || (mode === "swap" ? fromName : null);
+  if (!toName) throw new Error("to_chain is required (e.g. base, ethereum, arbitrum, optimism, polygon, bsc, avalanche, solana or a numeric chain id)");
+  const fromChain = chainId(fromName, "relay"), toChain = chainId(toName, "relay");
+  if (!fromChain || !toChain) throw new Error("unknown chain; use base, ethereum, arbitrum, optimism, polygon, bsc, avalanche, gnosis, linea, scroll, zksync, blast, mantle, mode, celo, unichain, solana or a numeric EVM chain id");
+  if (mode === "swap" && fromChain !== toChain) throw new Error("swap quotes are same-chain; use /api/bridge-quote for cross-chain");
+  const fromTokenSym = q.get("from_token") || "USDC", toTokenSym = q.get("to_token") || "USDC";
+  const amount = q.get("amount"); if (!amount || !isFinite(+amount) || +amount <= 0) throw new Error("amount is required (human units, e.g. 100 for 100 USDC)");
+  const SOL_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, EVM_RE = /^0x[0-9a-fA-F]{40}$/, SOL_PLACEHOLDER = "BX8mCX2TkiYiYvU8s94QT4ebUY3E6C7t36bwYgjptCoN", EVM_PLACEHOLDER = "0x000000000000000000000000000000000000dEaD";
+  const fromIsSol = fromChain === SOLANA_IDS.relay, toIsSol = toChain === SOLANA_IDS.relay;
+  let fromAddress = q.get("from_address") || "";
+  if (!(fromIsSol ? SOL_RE : EVM_RE).test(fromAddress)) fromAddress = fromIsSol ? SOL_PLACEHOLDER : EVM_PLACEHOLDER;
+  let toAddress = q.get("to_address") || "";
+  if (!(toIsSol ? SOL_RE : EVM_RE).test(toAddress)) toAddress = toIsSol ? SOL_PLACEHOLDER : EVM_PLACEHOLDER;
+  const slippage = Math.min(Math.max(+(q.get("slippage") || 0.005), 0.0005), 0.05);
+  const errors = [];
+  let r = null, fromTok = null, toTok = null;
+  try { [fromTok, toTok] = await Promise.all([relayCurrency(fromChain, fromTokenSym), relayCurrency(toChain, toTokenSym)]); r = await relayQuote(fromChain, toChain, fromTok, toTok, amount, fromAddress, slippage, toAddress); }
+  catch (e) { errors.push("relay: " + e.message); }
+  if (!r) {
+    try { const lf = chainId(fromName, "lifi"), lt = chainId(toName, "lifi"); r = await lifiQuote(lf, lt, fromTokenSym, toTokenSym, amount, fromAddress, slippage); }
+    catch (e) { errors.push("lifi: " + e.message); }
+  }
+  if (!r) throw new Error("no quote available: " + errors.join("; "));
+  return {
+    type: fromChain === toChain ? "swap" : "bridge", provider: r.provider, route: r.route,
+    from: { chain: String(fromName).toLowerCase(), chain_id: fromChain, token: fromTok?.symbol || r.from_symbol || fromTokenSym, address: fromTok?.address || null, amount: +amount, amount_usd: r.from_amount_usd },
+    to: { chain: String(toName).toLowerCase(), chain_id: toChain, token: toTok?.symbol || r.to_symbol || toTokenSym, address: toTok?.address || null, amount: r.to_amount, amount_min: r.to_amount_min, amount_usd: r.to_amount_usd },
+    costs: { gas_usd: r.gas_usd, fees_usd: r.fees_usd, total_cost_usd: +(r.gas_usd + r.fees_usd).toFixed(4), fee_breakdown: r.fee_breakdown, price_impact_pct: r.price_impact_pct },
+    estimated_duration_seconds: r.duration_seconds, slippage, request_id: r.request_id || null, fallback_errors: errors.length ? errors : undefined,
+    note: "Quote only. To execute, request the same quote from the provider with your own wallet as from_address and sign the returned transaction(s). Amounts are estimates at quote time.",
+  };
+}
+
+// ---------- ENS ----------
+async function fetchEns(q) {
+  const name = (q.get("name") || q.get("address") || q.get("query") || "").trim();
+  if (!name) throw new Error("name (e.g. vitalik.eth) or address (0x...) is required");
+  const isAddr = /^0x[0-9a-fA-F]{40}$/.test(name);
+  if (!isAddr && !/^[a-z0-9-_.]+\.[a-z]{2,}$/i.test(name)) throw new Error("name must look like example.eth or be a 0x address");
+  let primary = null, err = null;
+  try { const r = await fetch(`https://api.ensideas.com/ens/resolve/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) }); if (r.ok) primary = await r.json(); } catch (e) { err = e; }
+  let extra = null;
+  try { const r = await fetch(`https://ensdata.net/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) }); if (r.ok) extra = await r.json(); } catch {}
+  if (!primary && !extra) throw new Error("ENS lookup failed upstream");
+  const address = primary?.address || extra?.address || null;
+  const ensName = primary?.name || extra?.ens || (isAddr ? null : name);
+  if (!address && !ensName) throw new Error("not found");
+  const records = extra ? Object.fromEntries(Object.entries(extra).filter(([k]) => ["url", "email", "twitter", "github", "discord", "telegram", "description", "contentHash", "header", "location", "notice", "keywords"].includes(k) && extra[k])) : {};
+  return { query: name, name: ensName, address, avatar: primary?.avatar || extra?.avatar_url || extra?.avatar || null, display_name: primary?.displayName || ensName, records, source: "ENS (mainnet) via ensideas + ensdata" };
+}
+
+// ---------- Zakat ----------
+const TROY_OZ_G = 31.1034768;
+async function metalPrices() {
+  const out = { gold_usd_per_oz: null, silver_usd_per_oz: null, source: null };
+  try {
+    const [g, s] = await Promise.all([fetch("https://api.gold-api.com/price/XAU", { signal: AbortSignal.timeout(6000) }), fetch("https://api.gold-api.com/price/XAG", { signal: AbortSignal.timeout(6000) })]);
+    if (g.ok && s.ok) { out.gold_usd_per_oz = +(await g.json()).price; out.silver_usd_per_oz = +(await s.json()).price; out.source = "gold-api.com spot"; }
+  } catch {}
+  if (!out.gold_usd_per_oz) {
+    try { const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=pax-gold&vs_currencies=usd", { signal: AbortSignal.timeout(6000) }); const j = await r.json(); out.gold_usd_per_oz = +j["pax-gold"].usd; out.source = "PAXG (tokenized gold) via CoinGecko; silver unavailable"; } catch {}
+  }
+  if (!out.gold_usd_per_oz) throw new Error("metal prices unavailable");
+  return out;
+}
+async function fetchZakat(q) {
+  const num = (k) => { const v = q.get(k); if (v == null || v === "") return 0; const n = +v; if (!isFinite(n) || n < 0) throw new Error(`${k} must be a non-negative number`); return n; };
+  const currency = (q.get("currency") || "USD").toUpperCase();
+  let rate = 1;
+  if (currency !== "USD") { const r = await fetch(`https://api.frankfurter.dev/v1/latest?base=USD&symbols=${currency}`, { signal: AbortSignal.timeout(6000) }); if (!r.ok) throw new Error("unsupported currency"); rate = (await r.json()).rates[currency]; if (!rate) throw new Error("unsupported currency"); }
+  const m = await metalPrices();
+  const goldPerGram = (m.gold_usd_per_oz / TROY_OZ_G) * rate, silverPerGram = m.silver_usd_per_oz ? (m.silver_usd_per_oz / TROY_OZ_G) * rate : null;
+  const assets = { cash: num("cash"), gold_grams: num("gold_grams"), silver_grams: num("silver_grams"), investments: num("investments"), business_inventory: num("business_inventory"), receivables: num("receivables"), crypto: num("crypto"), other: num("other") };
+  const liabilities = num("debts");
+  const goldValue = assets.gold_grams * goldPerGram, silverValue = silverPerGram ? assets.silver_grams * silverPerGram : 0;
+  const total = assets.cash + goldValue + silverValue + assets.investments + assets.business_inventory + assets.receivables + assets.crypto + assets.other;
+  const net = Math.max(0, total - liabilities);
+  const nisabGold = 85 * goldPerGram, nisabSilver = silverPerGram ? 595 * silverPerGram : null;
+  const standard = (q.get("nisab") || "silver").toLowerCase() === "gold" || !nisabSilver ? "gold" : "silver";
+  const nisab = standard === "gold" ? nisabGold : nisabSilver;
+  const due = net >= nisab ? net * 0.025 : 0;
+  return {
+    currency, prices: { gold_per_gram: +goldPerGram.toFixed(2), silver_per_gram: silverPerGram ? +silverPerGram.toFixed(3) : null, source: m.source },
+    nisab: { standard_used: standard, gold_85g: +nisabGold.toFixed(2), silver_595g: nisabSilver ? +nisabSilver.toFixed(2) : null },
+    assets: { ...assets, gold_value: +goldValue.toFixed(2), silver_value: +silverValue.toFixed(2) }, liabilities_deducted: liabilities,
+    zakatable_net_worth: +net.toFixed(2), above_nisab: net >= nisab, zakat_rate: 0.025, zakat_due: +due.toFixed(2),
+    notes: ["Zakat is due on wealth held for one lunar year (hawl); this computes 2.5% of current zakatable net assets.", "Silver nisab (595 g) is the more cautious threshold and the default; pass nisab=gold to use 85 g of gold.", "Jewellery, pensions and long-term debt are treated differently by different schools; consult a scholar for your situation."],
+  };
+}
+
+// ---------- Islamic calendar ----------
+function jdFromHijri(y, m, d) { return d + Math.ceil(29.5 * (m - 1)) + (y - 1) * 354 + Math.floor((3 + 11 * y) / 30) + 1948439.5 - 1; }
+function gregorianFromJD(jd) { const z = Math.floor(jd + 0.5), a = Math.floor((z - 1867216.25) / 36524.25), A = z + 1 + a - Math.floor(a / 4), B = A + 1524, C = Math.floor((B - 122.1) / 365.25), D = Math.floor(365.25 * C), E = Math.floor((B - D) / 30.6001); const day = B - D - Math.floor(30.6001 * E), month = E < 14 ? E - 1 : E - 13, year = month > 2 ? C - 4716 : C - 4715; return { year, month, day, iso: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}` }; }
+const ISLAMIC_EVENTS = [[1, 1, "Islamic New Year (1 Muharram)"], [1, 10, "Day of Ashura"], [3, 12, "Mawlid an-Nabi (12 Rabi' al-awwal)"], [7, 27, "Isra and Mi'raj (27 Rajab)"], [8, 15, "Mid-Sha'ban (Laylat al-Bara'ah)"], [9, 1, "First day of Ramadan"], [9, 27, "Laylat al-Qadr (27 Ramadan, commonly observed)"], [10, 1, "Eid al-Fitr (1 Shawwal)"], [12, 9, "Day of Arafah (9 Dhu al-Hijjah)"], [12, 10, "Eid al-Adha (10 Dhu al-Hijjah)"]];
+async function fetchIslamicCalendar(q) {
+  const out = { note: "Arithmetical (tabular) Hijri calendar; official dates depend on moon sighting and may differ by one day." };
+  const date = q.get("date"), hijri = q.get("hijri");
+  if (date) { if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("date must be YYYY-MM-DD"); const [y, m, d] = date.split("-").map(Number); out.gregorian = date; out.hijri = hijriFromJD(julianDay(y, m, d) + 0.5); }
+  else if (hijri) { const m = /^(\d{3,4})-(\d{1,2})-(\d{1,2})$/.exec(hijri); if (!m) throw new Error("hijri must be YYYY-MM-DD in the Hijri calendar, e.g. 1448-09-01"); const g = gregorianFromJD(jdFromHijri(+m[1], +m[2], +m[3])); out.hijri_input = hijri; out.gregorian = g.iso; out.hijri = hijriFromJD(julianDay(g.year, g.month, g.day) + 0.5); }
+  else { const now = new Date(); const y = now.getUTCFullYear(), m = now.getUTCMonth() + 1, d = now.getUTCDate(); out.gregorian = now.toISOString().slice(0, 10); out.hijri = hijriFromJD(julianDay(y, m, d) + 0.5); }
+  const year = +(q.get("year") || (out.gregorian || "").slice(0, 4));
+  if (isFinite(year) && year > 1900 && year < 2200) {
+    const events = [];
+    const hy0 = hijriFromJD(julianDay(year, 1, 1) + 0.5).year;
+    for (const hy of [hy0, hy0 + 1]) for (const [hm, hd, name] of ISLAMIC_EVENTS) { const g = gregorianFromJD(jdFromHijri(hy, hm, hd)); if (g.year === year) events.push({ name, hijri: `${hd} ${["Muharram", "Safar", "Rabi' al-awwal", "Rabi' al-thani", "Jumada al-awwal", "Jumada al-thani", "Rajab", "Sha'ban", "Ramadan", "Shawwal", "Dhu al-Qi'dah", "Dhu al-Hijjah"][hm - 1]} ${hy} AH`, gregorian: g.iso }); }
+    events.sort((a, b) => a.gregorian.localeCompare(b.gregorian));
+    out.year = year; out.events = events;
+  }
+  return out;
+}
+
+const EXT3_ROUTES = {
+  "/api/bridge-quote": {
+    price: "$0.01",
+    description: "Best cross-chain bridge route and quote for moving a token between chains (Base, Ethereum, Arbitrum, Optimism, Polygon, BSC, Avalanche, Solana and more): output amount, fees, gas, duration, via Relay (LI.FI fallback).",
+    ext: bazaarExt({ input: { from_chain: "base", to_chain: "arbitrum", from_token: "USDC", to_token: "USDC", amount: "100" }, inputSchema: { properties: { from_chain: { type: "string", description: "Source chain name or id (base, ethereum, arbitrum, optimism, polygon, bsc, avalanche, solana, ...)" }, to_chain: { type: "string", description: "Destination chain name or id" }, from_token: { type: "string", description: "Token symbol or address on the source chain (default USDC)" }, to_token: { type: "string", description: "Token symbol or address on the destination chain (default USDC)" }, amount: { type: "string", description: "Amount in human units, e.g. 100" }, from_address: { type: "string", description: "Optional sender wallet; required for an executable transaction request" }, to_address: { type: "string", description: "Optional recipient wallet on the destination chain (Solana address for Solana destinations)" }, slippage: { type: "string", description: "Max slippage fraction, 0.0005-0.05 (default 0.005)" } }, required: ["to_chain", "amount"] }, output: { example: { type: "bridge", route: { tool_name: "Across" }, to: { amount: 99.82, amount_usd: 99.5 }, costs: { total_cost_usd: 0.21 }, estimated_duration_seconds: 60 } } }),
+    handler: halalSafe((q) => fetchBridgeQuote(q, "bridge")),
+  },
+  "/api/swap-quote": {
+    price: "$0.01",
+    description: "Best same-chain swap quote (DEX aggregation) for any token pair on Base, Ethereum, Arbitrum, Optimism, Polygon, BSC, Avalanche, Solana and more: output amount, minimum received, fees, gas, via Relay (LI.FI fallback).",
+    ext: bazaarExt({ input: { from_chain: "base", from_token: "ETH", to_token: "USDC", amount: "0.1" }, inputSchema: { properties: { from_chain: { type: "string", description: "Chain name or id (default base)" }, from_token: { type: "string", description: "Token symbol or address to sell" }, to_token: { type: "string", description: "Token symbol or address to buy" }, amount: { type: "string", description: "Amount to sell in human units" }, from_address: { type: "string", description: "Optional wallet; required for an executable transaction request" }, slippage: { type: "string", description: "Max slippage fraction (default 0.005)" } }, required: ["from_token", "to_token", "amount"] }, output: { example: { type: "swap", route: { tool_name: "Uniswap V3" }, to: { amount: 227.41, amount_min: 226.3 }, costs: { total_cost_usd: 0.02 } } } }),
+    handler: halalSafe((q) => fetchBridgeQuote(q, "swap")),
+  },
+  "/api/ens": {
+    price: "$0.001",
+    description: "ENS lookup: resolve a .eth name to an address (or an address to its primary name) with avatar and profile records (url, twitter, github, email, description).",
+    ext: bazaarExt({ input: { name: "vitalik.eth" }, inputSchema: { properties: { name: { type: "string", description: "ENS name such as vitalik.eth, or a 0x address for reverse lookup" } }, required: ["name"] }, output: { example: { name: "vitalik.eth", address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", avatar: "https://metadata.ens.domains/mainnet/avatar/vitalik.eth", records: { url: "https://vitalik.ca" } } } }),
+    handler: halalSafe(fetchEns),
+  },
+  "/api/zakat": {
+    price: "$0.005",
+    description: "Zakat calculator: live gold/silver nisab thresholds, zakatable net worth and 2.5% due, from cash, gold/silver grams, investments, crypto, business inventory, receivables and debts, in any major currency.",
+    ext: bazaarExt({ input: { cash: "12000", gold_grams: "40", investments: "8000", crypto: "1500", debts: "2000", currency: "USD" }, inputSchema: { properties: { cash: { type: "string", description: "Cash and bank balances" }, gold_grams: { type: "string", description: "Gold held, in grams" }, silver_grams: { type: "string", description: "Silver held, in grams" }, investments: { type: "string", description: "Stocks, funds and other liquid investments" }, crypto: { type: "string", description: "Crypto holdings (fiat value)" }, business_inventory: { type: "string", description: "Trade goods / inventory value" }, receivables: { type: "string", description: "Money owed to you that you expect to receive" }, other: { type: "string", description: "Other zakatable assets" }, debts: { type: "string", description: "Short-term debts due (deducted)" }, currency: { type: "string", description: "ISO currency code (default USD)" }, nisab: { type: "string", description: "silver (default, 595 g) or gold (85 g)" } }, required: [] }, output: { example: { nisab: { standard_used: "silver", silver_595g: 1005.3 }, zakatable_net_worth: 24800, above_nisab: true, zakat_due: 620 } } }),
+    handler: halalSafe(fetchZakat),
+  },
+  "/api/islamic-calendar": {
+    price: "$0.002",
+    description: "Islamic (Hijri) calendar: convert Gregorian↔Hijri dates and list the year's Islamic events (Ramadan start, Eid al-Fitr, Eid al-Adha, Ashura, Mawlid, Isra Mi'raj, Arafah, Laylat al-Qadr) with Gregorian dates.",
+    ext: bazaarExt({ input: { year: "2027" }, inputSchema: { properties: { date: { type: "string", description: "Gregorian date YYYY-MM-DD to convert (default today)" }, hijri: { type: "string", description: "Hijri date YYYY-MM-DD to convert to Gregorian, e.g. 1448-09-01" }, year: { type: "string", description: "Gregorian year to list Islamic events for (default: the converted date's year)" } }, required: [] }, output: { example: { gregorian: "2026-11-05", hijri: { formatted: "24 Jumada al-awwal 1448 AH" }, events: [{ name: "First day of Ramadan", gregorian: "2027-02-08" }] } } }),
+    handler: halalSafe(fetchIslamicCalendar),
+  },
+};
+Object.assign(ROUTES, EXT3_ROUTES);
 
 
 export default {
