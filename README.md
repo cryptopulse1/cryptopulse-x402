@@ -4,13 +4,15 @@
 
 No API keys, no accounts, no subscriptions. Every endpoint answers `HTTP 402` with [x402](https://x402.org) payment requirements; your agent retries with a signed USDC micropayment (**Base** or **Solana**) and gets the data. Prices are **$0.001–$0.10 per call**.
 
-24 endpoints in three groups:
+29 endpoints in four groups:
 
 | Group | Endpoints | Price |
 |---|---|---|
 | **Crypto market data** | `/api/price`, `/api/trending`, `/api/fear-greed`, `/api/gas`, `/api/ohlc`, `/api/token-pairs`, `/api/token-risk`, `/api/yields`, `/api/market-summary`, `/api/token-score`, `/api/screener`, `/api/funding-rates`, `/api/stablecoins`, `/api/dex-volume`, `/api/wallet` | $0.002–$0.10 |
 | **Halal food, mosques & prayer** | `/api/halal/near`, `/api/halal/city`, `/api/halal/place`, `/api/mosques/near`, `/api/mosques/city`, `/api/prayer-times`, `/api/qibla`, `/api/trip/halal` | $0.001–$0.02 |
 | **Fiat FX** | `/api/fx` (ECB reference rates, conversion, history) | $0.001 |
+| **Swaps, bridges & identity** | `/api/bridge-quote` (cross-chain route + quote via Relay, LI.FI fallback), `/api/swap-quote` (same-chain DEX quote), `/api/ens` (name ↔ address, avatar, records) | $0.001–$0.01 |
+| **Islamic finance & calendar** | `/api/zakat` (live gold/silver nisab, 2.5% due, any currency), `/api/islamic-calendar` (Gregorian ↔ Hijri, yearly events) | $0.002–$0.005 |
 
 The halal index holds **17,687 halal restaurants, grocers and butchers** and **164,761 mosques and prayer spaces** worldwide (OpenStreetMap, ODbL, refreshed monthly). Prayer times are computed astronomically with 17 calculation methods, Hanafi/Standard Asr, high-latitude handling and Hijri dates. `/api/trip/halal` bundles prayer times, qibla, nearby halal food and nearby mosques for a city in one call.
 
@@ -49,7 +51,7 @@ Add a Streamable-HTTP server:
 
 `initialize` and `tools/list` are free. Paid tool calls return `402` with the same x402 headers; x402-aware MCP clients (or an x402 proxy) retry with payment automatically. Registered in the official MCP Registry as `ai.saascloud/cryptopulse`.
 
-Tools: `price`, `trending`, `fear_greed`, `gas`, `ohlc`, `token_pairs`, `token_risk`, `yields`, `market_summary`, `token_score`, `screener`, `funding_rates`, `stablecoins`, `dex_volume`, `wallet`, `halal_near`, `halal_city`, `halal_place`, `mosques_near`, `mosques_city`, `prayer_times`, `qibla`, `trip_halal`, `fx`.
+Tools: `price`, `trending`, `fear_greed`, `gas`, `ohlc`, `token_pairs`, `token_risk`, `yields`, `market_summary`, `token_score`, `screener`, `funding_rates`, `stablecoins`, `dex_volume`, `wallet`, `halal_near`, `halal_city`, `halal_place`, `mosques_near`, `mosques_city`, `prayer_times`, `qibla`, `trip_halal`, `fx`, `bridge_quote`, `swap_quote`, `ens`, `zakat`, `islamic_calendar`.
 
 ## Example responses
 
@@ -65,6 +67,23 @@ Tools: `price`, `trending`, `fear_greed`, `gas`, `ohlc`, `token_pairs`, `token_r
 
 ```json
 { "results": [ { "symbol": "BTC", "funding_rate_1h": 0.0000125, "funding_apr_pct": 10.95, "mark_price": 77402, "open_interest_usd": 3243000000 } ] }
+```
+
+`GET /api/bridge-quote?from_chain=base&to_chain=solana&from_token=USDC&to_token=USDC&amount=50`
+
+```json
+{ "type": "bridge", "provider": "Relay",
+  "from": { "chain": "base", "token": "USDC", "amount": 50 },
+  "to": { "chain": "solana", "token": "USDC", "amount": 49.80, "amount_usd": 49.78 },
+  "costs": { "gas_usd": 0.0075, "fees_usd": 0.19, "total_cost_usd": 0.1975 },
+  "estimated_duration_seconds": 1 }
+```
+
+`GET /api/zakat?cash=12000&gold_grams=40&investments=8000&debts=2000`
+
+```json
+{ "nisab": { "standard_used": "silver", "gold_85g": 11244.16, "silver_595g": 1002.84 },
+  "zakatable_net_worth": 23281.72, "above_nisab": true, "zakat_rate": 0.025, "zakat_due": 582.04 }
 ```
 
 ## How it works
